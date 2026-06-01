@@ -7083,6 +7083,40 @@ async fn build_fetch_enable_params(state: &DaemonState, patterns: Vec<Value>) ->
     }
 }
 
+fn parse_route_response(cmd: &Value) -> Option<RouteResponse> {
+    cmd.get("response")
+        .and_then(|v| {
+            if v.is_null() {
+                return None;
+            }
+            Some(RouteResponse {
+                status: v.get("status").and_then(|s| s.as_u64()).map(|s| s as u16),
+                body: v.get("body").and_then(|s| s.as_str()).map(String::from),
+                content_type: v
+                    .get("contentType")
+                    .and_then(|s| s.as_str())
+                    .map(String::from),
+                headers: v.get("headers").and_then(|h| {
+                    h.as_object().map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                }),
+            })
+        })
+        .or_else(|| {
+            cmd.get("body")
+                .and_then(|v| v.as_str())
+                .map(|body| RouteResponse {
+                    status: None,
+                    body: Some(body.to_string()),
+                    content_type: None,
+                    headers: None,
+                })
+        })
+}
+
 async fn handle_route(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
@@ -7115,26 +7149,7 @@ async fn handle_route(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         })
         .unwrap_or_default();
 
-    let response = cmd.get("response").and_then(|v| {
-        if v.is_null() {
-            return None;
-        }
-        Some(RouteResponse {
-            status: v.get("status").and_then(|s| s.as_u64()).map(|s| s as u16),
-            body: v.get("body").and_then(|s| s.as_str()).map(String::from),
-            content_type: v
-                .get("contentType")
-                .and_then(|s| s.as_str())
-                .map(String::from),
-            headers: v.get("headers").and_then(|h| {
-                h.as_object().map(|m| {
-                    m.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-            }),
-        })
-    });
+    let response = parse_route_response(cmd);
 
     {
         let mut routes = state.routes.write().await;
@@ -8886,6 +8901,42 @@ mod tests {
         let patterns = build_fetch_patterns(&state).await;
         assert_eq!(patterns.len(), 1);
         assert_eq!(patterns[0]["urlPattern"], "https://example.com/*");
+    }
+
+    #[test]
+    fn test_parse_route_response_from_nested_response() {
+        let response = parse_route_response(&json!({
+            "response": {
+                "status": 201,
+                "body": "{\"ok\":true}",
+                "contentType": "application/json",
+                "headers": { "x-test": "yes" }
+            }
+        }))
+        .expect("response should parse");
+
+        assert_eq!(response.status, Some(201));
+        assert_eq!(response.body.as_deref(), Some("{\"ok\":true}"));
+        assert_eq!(response.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            response
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("x-test"))
+                .map(String::as_str),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn test_parse_route_response_accepts_legacy_top_level_body() {
+        let response = parse_route_response(&json!({ "body": "{\"users\":[]}" }))
+            .expect("legacy body should parse");
+
+        assert_eq!(response.status, None);
+        assert_eq!(response.body.as_deref(), Some("{\"users\":[]}"));
+        assert_eq!(response.content_type, None);
+        assert_eq!(response.headers, None);
     }
 
     #[tokio::test]

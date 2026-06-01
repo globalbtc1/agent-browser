@@ -20,7 +20,7 @@ agent-browser record stop
 agent-browser record start ./demo.webm https://example.com
 ```
 
-If no URL is provided, recording starts from the current page. The recording context preserves cookies and localStorage from the active session.
+If no URL is provided, recording starts from the current page. The recording context copies cookies from the active session.
 
 ## Commands
 
@@ -84,7 +84,7 @@ Screenshots and videos work well together: screenshots capture precise still sta
     <tr><td>Container</td><td>WebM</td></tr>
     <tr><td>Common extension</td><td><code>.webm</code></td></tr>
     <tr><td>Viewport</td><td>Uses the active browser viewport settings</td></tr>
-    <tr><td>State</td><td>Preserves cookies and localStorage from the active session</td></tr>
+    <tr><td>State</td><td>Copies cookies from the active session</td></tr>
   </tbody>
 </table>
 
@@ -94,4 +94,3 @@ Screenshots and videos work well together: screenshots capture precise still sta
 - Long recordings can use significant disk space.
 - Use `record stop` before closing a session if you need the file flushed.
 - Some constrained headless environments may have codec or GPU limitations.
-
