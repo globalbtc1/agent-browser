@@ -1141,8 +1141,27 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             return;
         }
 
-        // Default success
-        println!("{} Done", color::success_indicator());
+        // Default success. A semantic-locator match report shows what was
+        // picked, so a wrong pick is visible immediately instead of after
+        // the next snapshot.
+        if let Some(matched) = data.get("matched").and_then(|v| v.as_str()) {
+            let others = data
+                .get("otherMatches")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if others > 0 {
+                println!(
+                    "{} Done — matched {} ({} other matches on the page)",
+                    color::success_indicator(),
+                    matched,
+                    others
+                );
+            } else {
+                println!("{} Done — matched {}", color::success_indicator(), matched);
+            }
+        } else {
+            println!("{} Done", color::success_indicator());
+        }
     }
 
     print_warning(resp);

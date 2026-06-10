@@ -2457,9 +2457,89 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
         .and_then(|v| v.as_str())
         .ok_or("Missing 'script' parameter")?;
 
-    let result = mgr.evaluate(script, None).await?;
+    // Honor an active `frame <sel>` selection, like element resolution does:
+    // an OOPIF evaluates on its dedicated session, a same-process frame
+    // evaluates in the frame's own realm through the owner element.
+    let result = match state.active_frame_id.as_deref() {
+        Some(frame_id) => match state.iframe_sessions.get(frame_id) {
+            Some(frame_session) => mgr.evaluate_on_session(frame_session, script).await?,
+            None => {
+                let session_id = mgr.active_session_id()?.to_string();
+                evaluate_in_same_process_frame(&mgr.client, &session_id, frame_id, script).await?
+            }
+        },
+        None => mgr.evaluate(script, None).await?,
+    };
     let url = mgr.get_url().await.unwrap_or_default();
     Ok(json!({ "result": result, "origin": url }))
+}
+
+/// `eval` inside a same-process iframe selected via `frame <sel>`: runs the
+/// script in the frame's own realm so document/window resolve to the frame.
+/// A page CSP that forbids 'unsafe-eval' rejects this loudly rather than
+/// letting the script silently evaluate against the top document.
+async fn evaluate_in_same_process_frame(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    frame_id: &str,
+    script: &str,
+) -> Result<Value, String> {
+    match evaluate_in_same_process_frame_once(client, session_id, frame_id, script).await {
+        // Same top-level-return accommodation as evaluate_on_session. No
+        // `await` prefix here: win.eval has no REPL mode, and the IIFE's
+        // promise is already resolved by awaitPromise on callFunctionOn.
+        Err(e) if e.contains("Illegal return statement") => {
+            evaluate_in_same_process_frame_once(
+                client,
+                session_id,
+                frame_id,
+                &format!("(async () => {{ {script} }})()"),
+            )
+            .await
+        }
+        other => other,
+    }
+}
+
+async fn evaluate_in_same_process_frame_once(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    frame_id: &str,
+    script: &str,
+) -> Result<Value, String> {
+    let owner_object_id =
+        super::element::frame_owner_object_id(client, session_id, frame_id).await?;
+    let result = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(json!({
+                "objectId": owner_object_id,
+                "functionDeclaration": "function(src) {
+                    const win = this.contentWindow;
+                    if (!win) throw new Error('Frame document is not available');
+                    return win.eval(src);
+                }",
+                "arguments": [{ "value": script }],
+                "returnByValue": true,
+                "awaitPromise": true,
+            })),
+            Some(session_id),
+        )
+        .await?;
+    if let Some(details) = result.get("exceptionDetails") {
+        let msg = details
+            .get("exception")
+            .and_then(|e| e.get("description"))
+            .and_then(|d| d.as_str())
+            .or_else(|| details.get("text").and_then(|t| t.as_str()))
+            .unwrap_or("evaluation failed");
+        return Err(format!("Evaluation error: {}", msg));
+    }
+    Ok(result
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null))
 }
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
@@ -3026,13 +3106,47 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     Ok(json!({ "unchecked": selector }))
 }
 
+/// Where a content wait (`wait --text/--selector/--url/--function`) polls
+/// while a `frame <sel>` selection is active.
+enum WaitRoute {
+    Main,
+    /// Out-of-process iframe with its own CDP session.
+    FrameSession(String),
+    /// Same-process iframe, reached through its owner element.
+    SameProcessFrame(String),
+}
+
 async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let timeout_ms = state.timeout_ms(cmd);
 
+    // Honor an active `frame <sel>` selection for content waits, like element
+    // resolution does: an OOPIF polls on its dedicated session, a same-process
+    // frame polls through the owner element's contentDocument.
+    let frame_route = match state.active_frame_id.as_deref() {
+        Some(frame_id) => match state.iframe_sessions.get(frame_id) {
+            Some(frame_session) => WaitRoute::FrameSession(frame_session.clone()),
+            None => WaitRoute::SameProcessFrame(frame_id.to_string()),
+        },
+        None => WaitRoute::Main,
+    };
+
     if let Some(text) = cmd.get("text").and_then(|v| v.as_str()) {
-        wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?;
+        let quoted = serde_json::to_string(text).unwrap_or_default();
+        match &frame_route {
+            WaitRoute::Main => wait_for_text(&mgr.client, &session_id, text, timeout_ms).await?,
+            WaitRoute::FrameSession(frame_session) => {
+                wait_for_text(&mgr.client, frame_session, text, timeout_ms).await?
+            }
+            WaitRoute::SameProcessFrame(frame_id) => {
+                let check = format!(
+                    "(((doc.body && doc.body.innerText) || '')).toLowerCase().includes({quoted}.toLowerCase())"
+                );
+                poll_in_frame_until_true(&mgr.client, &session_id, frame_id, &check, timeout_ms)
+                    .await?
+            }
+        }
         return Ok(json!({ "waited": "text", "text": text }));
     }
 
@@ -3041,39 +3155,61 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
             .get("state")
             .and_then(|v| v.as_str())
             .unwrap_or("visible");
-        // Honor an active `frame <sel>` selection, like element resolution does.
-        match state.active_frame_id.as_deref() {
-            Some(frame_id) => match state.iframe_sessions.get(frame_id) {
-                Some(frame_session) => {
-                    wait_for_selector(&mgr.client, frame_session, selector, state_str, timeout_ms)
-                        .await?
-                }
-                None => {
-                    wait_for_selector_in_frame(
-                        &mgr.client,
-                        &session_id,
-                        frame_id,
-                        selector,
-                        state_str,
-                        timeout_ms,
-                    )
-                    .await?
-                }
-            },
-            None => {
+        match &frame_route {
+            WaitRoute::Main => {
                 wait_for_selector(&mgr.client, &session_id, selector, state_str, timeout_ms).await?
+            }
+            WaitRoute::FrameSession(frame_session) => {
+                wait_for_selector(&mgr.client, frame_session, selector, state_str, timeout_ms)
+                    .await?
+            }
+            WaitRoute::SameProcessFrame(frame_id) => {
+                wait_for_selector_in_frame(
+                    &mgr.client,
+                    &session_id,
+                    frame_id,
+                    selector,
+                    state_str,
+                    timeout_ms,
+                )
+                .await?
             }
         }
         return Ok(json!({ "waited": "selector", "selector": selector }));
     }
 
     if let Some(url_pattern) = cmd.get("url").and_then(|v| v.as_str()) {
-        wait_for_url(&mgr.client, &session_id, url_pattern, timeout_ms).await?;
+        match &frame_route {
+            WaitRoute::Main => {
+                wait_for_url(&mgr.client, &session_id, url_pattern, timeout_ms).await?
+            }
+            WaitRoute::FrameSession(frame_session) => {
+                wait_for_url(&mgr.client, frame_session, url_pattern, timeout_ms).await?
+            }
+            WaitRoute::SameProcessFrame(frame_id) => {
+                let check = url_check_expression("doc.location.href", url_pattern);
+                poll_in_frame_until_true(&mgr.client, &session_id, frame_id, &check, timeout_ms)
+                    .await?
+            }
+        }
         return Ok(json!({ "waited": "url", "url": url_pattern }));
     }
 
     if let Some(fn_str) = cmd.get("function").and_then(|v| v.as_str()) {
-        wait_for_function(&mgr.client, &session_id, fn_str, timeout_ms).await?;
+        match &frame_route {
+            WaitRoute::Main => {
+                wait_for_function(&mgr.client, &session_id, fn_str, timeout_ms).await?
+            }
+            WaitRoute::FrameSession(frame_session) => {
+                wait_for_function(&mgr.client, frame_session, fn_str, timeout_ms).await?
+            }
+            WaitRoute::SameProcessFrame(frame_id) => {
+                let quoted = serde_json::to_string(fn_str).unwrap_or_default();
+                let check = format!("!!(doc.defaultView.eval({quoted}))");
+                poll_in_frame_until_true(&mgr.client, &session_id, frame_id, &check, timeout_ms)
+                    .await?
+            }
+        }
         return Ok(json!({ "waited": "function" }));
     }
 
@@ -3320,11 +3456,54 @@ async fn wait_for_url(
     pattern: &str,
     timeout_ms: u64,
 ) -> Result<(), String> {
-    let check_fn = format!(
-        "location.href.includes({})",
-        serde_json::to_string(pattern).unwrap_or_default()
-    );
+    let check_fn = url_check_expression("location.href", pattern);
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
+}
+
+/// `wait --url` accepts the glob patterns the docs advertise ("**/dashboard")
+/// as well as plain substrings. A glob used to be matched literally via
+/// includes(), so it could never succeed.
+fn url_check_expression(target: &str, pattern: &str) -> String {
+    if pattern.contains('*') {
+        format!(
+            "new RegExp({}).test({target})",
+            serde_json::to_string(&glob_to_js_regex(pattern)).unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{target}.includes({})",
+            serde_json::to_string(pattern).unwrap_or_default()
+        )
+    }
+}
+
+/// Playwright-style URL glob: `**` crosses path segments, `*` stays within
+/// one, and `?` is literal (in URLs it is the query separator, not a
+/// wildcard). Anchored, but a trailing query/hash never breaks the match.
+fn glob_to_js_regex(glob: &str) -> String {
+    let mut re = String::from("^");
+    let chars: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if chars.get(i + 1) == Some(&'*') {
+                    re.push_str(".*");
+                    i += 1;
+                } else {
+                    re.push_str("[^/]*");
+                }
+            }
+            c if "\\.+()[]{}^$|?".contains(c) => {
+                re.push('\\');
+                re.push(c);
+            }
+            c => re.push(c),
+        }
+        i += 1;
+    }
+    re.push_str("([?#].*)?$");
+    re
 }
 
 async fn wait_for_text(
@@ -3333,8 +3512,10 @@ async fn wait_for_text(
     text: &str,
     timeout_ms: u64,
 ) -> Result<(), String> {
+    // Case-insensitive: agents guess casing ("upload" vs "Uploaded") and a
+    // case miss costs a full timeout.
     let check_fn = format!(
-        "(document.body.innerText || '').includes({})",
+        "(document.body.innerText || '').toLowerCase().includes({}.toLowerCase())",
         serde_json::to_string(text).unwrap_or_default()
     );
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
@@ -3350,9 +3531,7 @@ async fn wait_for_function(
     poll_until_true(client, session_id, &check_fn, timeout_ms).await
 }
 
-/// wait_for_selector inside a same-process iframe selected via `frame <sel>`:
-/// polls through the owner element's contentDocument, which stays correct
-/// even if the frame navigates (the getter re-resolves every poll).
+/// wait_for_selector inside a same-process iframe selected via `frame <sel>`.
 async fn wait_for_selector_in_frame(
     client: &super::cdp::client::CdpClient,
     session_id: &str,
@@ -3361,8 +3540,6 @@ async fn wait_for_selector_in_frame(
     state: &str,
     timeout_ms: u64,
 ) -> Result<(), String> {
-    let owner_object_id =
-        super::element::frame_owner_object_id(client, session_id, frame_id).await?;
     let sel = serde_json::to_string(selector).unwrap_or_default();
     let check = match state {
         "attached" => format!("!!doc.querySelector({sel})"),
@@ -3385,6 +3562,22 @@ async fn wait_for_selector_in_frame(
             }})()"#,
         ),
     };
+    poll_in_frame_until_true(client, session_id, frame_id, &check, timeout_ms).await
+}
+
+/// Poll a boolean check inside a same-process iframe through the owner
+/// element's contentDocument (in scope as `doc`), which stays correct even if
+/// the frame navigates (the getter re-resolves every poll). Exceptions count
+/// as unsatisfied, matching poll_until_true.
+async fn poll_in_frame_until_true(
+    client: &super::cdp::client::CdpClient,
+    session_id: &str,
+    frame_id: &str,
+    check: &str,
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let owner_object_id =
+        super::element::frame_owner_object_id(client, session_id, frame_id).await?;
     let function = format!(
         "function() {{ const doc = this.contentDocument; if (!doc) return false; return {check}; }}",
     );
@@ -6075,19 +6268,29 @@ async fn handle_semantic_locator(
             val = serde_json::to_string(value).unwrap_or_default(),
         ),
         _ => {
-            // "text" strategy
+            // "text" strategy. An element whose trimmed text equals the query
+            // beats the first substring hit in document order: `find text "2"`
+            // must pick the pagination link "2" over a price like "$24.99".
+            // The match report lets the agent see what was picked when the
+            // page had several candidates.
+            let value_json = serde_json::to_string(value).unwrap_or_default();
             format!(
                 r#"(() => {{
                     const all = document.querySelectorAll('*');
+                    let exact = null, partial = null, count = 0;
                     for (const el of all) {{
-                        if (el.children.length === 0 && {match_fn}) {{
-                            el.setAttribute('data-agent-browser-located', 'true');
-                            return true;
-                        }}
+                        if (el.children.length !== 0) continue;
+                        if (!({match_fn})) continue;
+                        count++;
+                        if (!exact && el.textContent.trim() === {value_json}) exact = el;
+                        if (!partial) partial = el;
                     }}
-                    return false;
+                    const el = exact || partial;
+                    if (!el) return null;
+                    el.setAttribute('data-agent-browser-located', 'true');
+                    const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+                    return {{ desc: '<' + el.tagName.toLowerCase() + '> "' + text + '"', others: count - 1 }};
                 }})()"#,
-                match_fn = match_fn,
             )
         }
     };
@@ -6105,18 +6308,25 @@ async fn handle_semantic_locator(
         )
         .await?;
 
-    if !result
-        .result
-        .value
-        .as_ref()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+    // Bool for the attribute-based strategies, a match report for "text".
+    let located = result.result.value.unwrap_or(Value::Null);
+    let match_report = located.as_object().cloned();
+    if match_report.is_none() && !located.as_bool().unwrap_or(false) {
         return Err(format!("No element found by {} '{}'", strategy, value));
     }
 
     let selector = "[data-agent-browser-located='true']";
-    let action_result = execute_subaction(cmd, state, selector).await;
+    let mut action_result = execute_subaction(cmd, state, selector).await;
+    if let (Ok(Value::Object(obj)), Some(report)) = (&mut action_result, match_report) {
+        if let Some(desc) = report.get("desc").and_then(|v| v.as_str()) {
+            obj.insert("matched".to_string(), json!(desc));
+        }
+        if let Some(others) = report.get("others").and_then(|v| v.as_u64()) {
+            if others > 0 {
+                obj.insert("otherMatches".to_string(), json!(others));
+            }
+        }
+    }
 
     if let Some(ref browser) = state.browser {
         let _ = browser
@@ -8402,6 +8612,35 @@ mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
     use std::fs;
+
+    #[test]
+    fn test_url_check_expression_keeps_substring_semantics_without_glob() {
+        assert_eq!(
+            url_check_expression("location.href", "example.com/path"),
+            "location.href.includes(\"example.com/path\")"
+        );
+    }
+
+    #[test]
+    fn test_glob_to_js_regex_translates_url_globs() {
+        // `**` crosses segments, `*` stays within one, and a trailing
+        // query/hash never breaks the match.
+        assert_eq!(glob_to_js_regex("**/dashboard"), "^.*/dashboard([?#].*)?$");
+        assert_eq!(
+            glob_to_js_regex("**/orders/*/edit"),
+            "^.*/orders/[^/]*/edit([?#].*)?$"
+        );
+        // Regex metacharacters in the pattern are literal.
+        assert_eq!(
+            glob_to_js_regex("**/search.php"),
+            "^.*/search\\.php([?#].*)?$"
+        );
+        // `?` is the query separator in URLs, never a single-char wildcard.
+        assert_eq!(
+            glob_to_js_regex("**/item?id=*"),
+            "^.*/item\\?id=[^/]*([?#].*)?$"
+        );
+    }
 
     fn unique_socket_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
