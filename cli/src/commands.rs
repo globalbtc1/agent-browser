@@ -363,10 +363,19 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 match rest[i] {
                     "--clear" => clear = true,
                     "--delay" => {
-                        if let Some(Ok(ms)) = rest.get(i + 1).map(|s| s.parse::<u64>()) {
-                            delay = Some(ms);
-                            i += 1;
-                        }
+                        // Error rather than silently drop a malformed value;
+                        // a dropped flag would type its argument into the field.
+                        let raw = rest
+                            .get(i + 1)
+                            .ok_or_else(|| ParseError::MissingArguments {
+                                context: "type --delay".to_string(),
+                                usage: "type <selector> <text> [--clear] [--delay <ms>]",
+                            })?;
+                        delay = Some(raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                            message: format!("--delay expects a number in ms, got '{}'", raw),
+                            usage: "type <selector> <text> [--clear] [--delay <ms>]",
+                        })?);
+                        i += 1;
                     }
                     other => text_parts.push(other),
                 }
@@ -574,12 +583,19 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             let mut rest = rest.clone();
             let mut timeout_ms: Option<u64> = None;
             if let Some(idx) = rest.iter().position(|&s| s == "--timeout") {
-                if let Some(Ok(ms)) = rest.get(idx + 1).map(|s| s.parse::<u64>()) {
-                    timeout_ms = Some(ms);
-                    rest.drain(idx..=idx + 1);
-                } else {
-                    rest.remove(idx);
-                }
+                // Error rather than silently drop a malformed value; a dropped
+                // flag would leave its argument to be misread as a selector.
+                let raw = rest
+                    .get(idx + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: "wait --timeout".to_string(),
+                        usage: "wait <selector|ms|--url|--load|--fn|--text> [--timeout <ms>]",
+                    })?;
+                timeout_ms = Some(raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!("--timeout expects a number in ms, got '{}'", raw),
+                    usage: "wait <selector|ms|--url|--load|--fn|--text> [--timeout <ms>]",
+                })?);
+                rest.drain(idx..=idx + 1);
             }
             let with_timeout = |mut cmd: Value| {
                 if let Some(ms) = timeout_ms {

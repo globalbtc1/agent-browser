@@ -150,6 +150,9 @@ pub struct PendingDialog {
     pub message: String,
     pub url: String,
     pub default_prompt: Option<String>,
+    /// Flat CDP session the dialog opened on. A dialog on a background tab
+    /// must not block commands targeting the active tab.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -245,6 +248,9 @@ pub struct DaemonState {
     pub mouse_state: MouseState,
     /// Tracks the currently open JavaScript dialog (alert/confirm/prompt), if any.
     pub pending_dialog: Option<PendingDialog>,
+    /// A mouse button left logically down because a dialog opened between
+    /// mousePressed and mouseReleased; released when the dialog is resolved.
+    pub pending_pointer_release: Option<super::interaction::PendingRelease>,
     /// When true, automatically dismiss `beforeunload` dialogs and accept `alert`
     /// dialogs so they never block the agent.  Enabled by default.
     pub auto_dialog: bool,
@@ -302,6 +308,7 @@ impl DaemonState {
             dialog_handler_task: None,
             mouse_state: MouseState::default(),
             pending_dialog: None,
+            pending_pointer_release: None,
             auto_dialog: !matches!(
                 env::var("AGENT_BROWSER_NO_AUTO_DIALOG").as_deref(),
                 Ok("1" | "true" | "yes")
@@ -1106,6 +1113,7 @@ impl DaemonState {
                                         message: dialog_event.message,
                                         url: dialog_event.url,
                                         default_prompt: dialog_event.default_prompt,
+                                        session_id: event.session_id.clone(),
                                     });
                                 }
                             }
@@ -1293,10 +1301,33 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     // any command that touches the page would hang until the client read
     // timeout. Fail fast with instructions instead. Actions in skip_launch
     // never touch the page; dialog/screenshot/url/title are browser-side.
+    // Only a dialog on the ACTIVE tab blocks: one on a background tab leaves
+    // the active tab's renderer responsive.
     if let Some(ref dialog) = state.pending_dialog {
-        let safe_during_dialog =
-            skip_launch || matches!(action, "dialog" | "screenshot" | "url" | "title");
-        if !safe_during_dialog {
+        let active_session = state
+            .browser
+            .as_ref()
+            .and_then(|m| m.active_session_id().ok().map(|s| s.to_string()));
+        let on_active_tab = match (&dialog.session_id, &active_session) {
+            (Some(dialog_sid), Some(active_sid)) => dialog_sid == active_sid,
+            // No session on the event = top-level page dialog; no browser = be safe.
+            _ => true,
+        };
+        // Tab and session management must stay usable: switching or closing
+        // tabs is exactly how an agent escapes a tab blocked by a dialog.
+        let safe_during_dialog = skip_launch
+            || matches!(
+                action,
+                "dialog"
+                    | "screenshot"
+                    | "url"
+                    | "title"
+                    | "tab_list"
+                    | "tab_new"
+                    | "tab_switch"
+                    | "tab_close"
+            );
+        if on_active_tab && !safe_during_dialog {
             return error_response(
                 &id,
                 &format!(
@@ -2715,7 +2746,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
 
-    let dialog_opened = interaction::click(
+    let result = interaction::click(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -2726,7 +2757,8 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     )
     .await?;
 
-    if dialog_opened {
+    if result.dialog_opened {
+        state.pending_pointer_release = result.pending_release;
         return Ok(json!({ "clicked": selector, "dialogOpened": true }));
     }
     Ok(json!({ "clicked": selector }))
@@ -2740,7 +2772,7 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    let dialog_opened = interaction::dblclick(
+    let result = interaction::dblclick(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -2748,7 +2780,8 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
-    if dialog_opened {
+    if result.dialog_opened {
+        state.pending_pointer_release = result.pending_release;
         return Ok(json!({ "clicked": selector, "dialogOpened": true }));
     }
     Ok(json!({ "clicked": selector }))
@@ -4809,6 +4842,15 @@ async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     let result = mgr.handle_dialog(accept, prompt_text).await;
     state.pending_dialog = None;
     result?;
+
+    // If a click's mousedown opened this dialog, the button is still logically
+    // down. Release it now that the page is unblocked so the next click does
+    // not register as a drag or double-click.
+    if let Some(release) = state.pending_pointer_release.take() {
+        if let Some(ref mgr) = state.browser {
+            let _ = interaction::dispatch_pending_release(&mgr.client, &release).await;
+        }
+    }
     Ok(json!({ "handled": true, "accepted": accept }))
 }
 
@@ -5778,7 +5820,7 @@ async fn execute_subaction(
 
     match subaction {
         "click" => {
-            let dialog_opened = interaction::click(
+            let result = interaction::click(
                 &mgr.client,
                 &session_id,
                 &state.ref_map,
@@ -5788,7 +5830,8 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
-            if dialog_opened {
+            if result.dialog_opened {
+                state.pending_pointer_release = result.pending_release;
                 return Ok(json!({ "clicked": selector, "dialogOpened": true }));
             }
             Ok(json!({ "clicked": selector }))

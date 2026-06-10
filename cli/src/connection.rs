@@ -848,21 +848,21 @@ fn has_os_error(error: &str, code: u32) -> bool {
     error.contains(&format!("(os error {})", code))
 }
 
-/// Socket read timeout for one request. The 30s floor covers ordinary
-/// commands; commands carrying an explicit operation timeout (e.g.
-/// `wait --timeout 120000`) get that plus margin, so the daemon can report
-/// a proper operation timeout instead of the client dying with EAGAIN at
-/// 30s and the retry loop re-sending the whole long-running command.
+/// Socket read timeout for one request. Ordinary commands get a 30s floor.
+/// Commands carrying an operation timeout (the wait family, which
+/// parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit
+/// --timeout is given) get that timeout plus margin, so the daemon can report
+/// a proper operation timeout instead of the client dying with EAGAIN at 30s
+/// and the retry loop re-sending the whole long-running command.
+///
+/// The env var is deliberately NOT consulted here. Reading it would apply a
+/// long wait budget to every command, so a genuinely hung daemon on a simple
+/// `url`/`title`/`snapshot` call would take the full budget to surface
+/// instead of 30s. Only commands that actually carry a `timeout` field get
+/// the extended budget, and that field is set client-side per invocation,
+/// avoiding the daemon's spawn-time env snapshot drifting from the client.
 fn read_timeout_for(cmd: &Value) -> Duration {
-    let op_ms = cmd
-        .get("timeout")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            std::env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-        })
-        .unwrap_or(0);
+    let op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
 
